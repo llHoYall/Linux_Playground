@@ -8,5 +8,6 @@ fake `ln` program.
 
 ## Usage
 
-* `$ ./ln <file> <file>`
+* `$ ./ln <source file> <destination file>`
+* `$ ./ln -s <source file> <destination file>`
 
