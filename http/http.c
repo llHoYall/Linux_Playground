@@ -13,6 +13,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netdb.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
@@ -20,6 +23,12 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <signal.h>
+#include <pwd.h>
+#include <grp.h>
+#include <syslog.h>
+
+#define _GNU_SOURCE
+#include <getopt.h>
 
 /* Definitions ---------------------------------------------------------------*/
 #define SERVER_NAME 						"HoYaHTTP"
@@ -29,6 +38,22 @@
 #define LINE_BUF_SIZE						4096
 #define MAX_REQUEST_BODY_LENGTH	(1024 * 1024)
 #define TIME_BUF_SIZE						64
+#define MAX_BACKLOG							5
+#define DEFAULT_PORT						"80"
+
+#define USAGE	"Usage: %s [--port=n] [--chroot --user=u --group=g] [--debug] <docroot>\n"
+
+/* Private Variables ---------------------------------------------------------*/
+static int debug_mode = 0;
+static struct option longopts[] = {
+	{"debug", 	no_argument, 				&debug_mode, 	1},
+	{"chroot", 	no_argument, 				NULL, 				'c'},
+	{"user", 		required_argument, 	NULL, 				'u'},
+	{"group", 	required_argument, 	NULL, 				'g'},
+	{"port", 		required_argument, 	NULL, 				'p'},
+	{"help", 		no_argument, 				NULL, 				'h'},
+	{0, 				0, 									0, 						0}
+};
 
 /* Structures ----------------------------------------------------------------*/
 struct HTTPHeaderField {
@@ -53,11 +78,16 @@ struct FileInfo {
 };
 
 /* Private Function Prototypes -----------------------------------------------*/
+static void SetupEnvironment(char* root, char* user, char* group);
+
 typedef void (*sighandler_t)(int);
 
 static void Signal_SetHandlers(void);
 static void Signal_Get(int sig, sighandler_t handler);
+static void Signal_DetachChildren(void);
 static void Signal_Exit(int sig);
+
+static void Handler_Noop(int sig);
 
 static void Service(FILE* in, FILE* out, char* docroot);
 static struct HTTPRequest* HTTP_ReadRequest(FILE* in);
@@ -76,27 +106,110 @@ static struct FileInfo* HTTP_GetFileInfo(char* docroot, char* urlpath);
 static char* HTTP_BuildFsPath(char* docroot, char* urlpath);
 static void HTTP_FreeFileInfo(struct FileInfo* info);
 static char* HTTP_GuessContentType(struct FileInfo* info);
+static int HTTP_ListenSocket(char* port);
+static void HTTP_ServerMain(int server_fd, char* docroot);
 
+static void BecomeDaemon(void);
 static void* hmalloc(size_t sz);
 static void Upcase(char* str);
-static void Log_PrintAndExit(char* fmt, ...);
+static void Log_PrintAndExit(const char* fmt, ...);
 
 /* Main Routines -------------------------------------------------------------*/
 int main(int argc, char* argv[]) {
-	if (argc != 2) {
-		fprintf(stderr, "Usage: %s <docroot>\n", argv[0]);
+	int do_chroot = 0;
+	char* user = NULL;
+	char* group = NULL;
+	char* port = NULL;
+	int opt;
+	while ((opt = getopt_long(argc, argv, "", longopts, NULL)) != -1) {
+		switch (opt) {
+			case 0:
+				break;
+
+			case 'c':
+				do_chroot = 1;
+				break;
+
+			case 'u':
+				user = optarg;
+				break;
+
+			case 'g':
+				group = optarg;
+				break;
+
+			case 'p':
+				port = optarg;
+				break;
+
+			case 'h':
+				fprintf(stdout, USAGE, argv[0]);
+				exit(0);
+
+			case '?':
+				fprintf(stderr, USAGE, argv[0]);
+				exit(1);
+		}
+	}
+	if (optind != argc - 1) {
+		fprintf(stderr, USAGE, argv[0]);
 		exit(1);
+	}
+	char* docroot = argv[optind];
+
+	if (do_chroot) {
+		SetupEnvironment(docroot, user, group);
+		docroot = "";
 	}
 
 	Signal_SetHandlers();
-	Service(stdin, stdout, argv[1]);
+	int server_fd = HTTP_ListenSocket(port);
+	if (!debug_mode) {
+		openlog(SERVER_NAME, LOG_PID | LOG_NDELAY, LOG_DAEMON);
+		BecomeDaemon();
+	}
+	HTTP_ServerMain(server_fd, docroot);
 	
 	exit(0);
 }
 
 /* Private Functions ---------------------------------------------------------*/
+static void SetupEnvironment(char* root, char* user, char* group) {
+	if (!user || !group) {
+		fprintf(stderr, "use both of --user and --group\n");
+		exit(1);
+	}
+
+	struct group* gr = getgrnam(group);
+	if (!gr) {
+		fprintf(stderr, "no such group: %s\n", group);
+		exit(1);
+	}
+	if (setgid(gr->gr_gid) < 0) {
+		perror("setgid(2)");
+		exit(1);
+	}
+	if (initgroups(user, gr->gr_gid) < 0) {
+		perror("initgroup(2)");
+		exit(1);
+	}
+	
+	struct passwd* pw = getpwnam(user);
+	if (!pw) {
+		fprintf(stderr, "no such user: %s\n", user);
+		exit(1);
+	}
+
+	chroot(root);
+	if (setuid(pw->pw_uid) < 0) {
+		perror("setuid(2)");
+		exit(1);
+	}
+}
+
 static void Signal_SetHandlers(void) {
-	Signal_Get(SIGPIPE, Signal_Exit);
+	Signal_Get(SIGTERM, Signal_Exit);
+	Signal_DetachChildren();
 }
 
 static void Signal_Get(int sig, sighandler_t handler) {
@@ -109,8 +222,22 @@ static void Signal_Get(int sig, sighandler_t handler) {
 	}
 }
 
+static void Signal_DetachChildren(void) {
+	struct sigaction act;
+	act.sa_handler = Handler_Noop;
+	sigemptyset(&act.sa_mask);
+	act.sa_flags = SA_RESTART | SA_NOCLDWAIT;
+	if (sigaction(SIGCHLD, &act, NULL) < 0) {
+		Log_PrintAndExit("sigaction() failed: %s", strerror(errno));
+	}
+}
+
 static void Signal_Exit(int sig) {
 	Log_PrintAndExit("exit by signal %d", sig);
+}
+
+static void Handler_Noop(int sig) {
+	(void)sig;
 }
 
 static void Service(FILE* in, FILE* out, char* docroot) {
@@ -377,6 +504,78 @@ static char* HTTP_GuessContentType(struct FileInfo* info) {
 	return "text/plain";
 }
 
+static int HTTP_ListenSocket(char* port) {
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+
+	int err;
+	struct addrinfo* res;
+	if ((err = getaddrinfo(NULL, port, &hints, &res)) != 0) {
+		Log_PrintAndExit(gai_strerror(err));
+	}
+
+	struct addrinfo* ai;
+	for (ai = res; ai; ai = ai->ai_next) {
+		int sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (sock < 0) {
+			continue;
+		}
+		if (bind(sock, ai->ai_addr, ai->ai_addrlen) < 0) {
+			close(sock);
+			continue;
+		}
+		freeaddrinfo(res);
+		return sock;
+	}
+	Log_PrintAndExit("failed to listen socket");
+	return -1;
+}
+
+static void HTTP_ServerMain(int server_fd, char* docroot) {
+	for (;;) {
+		struct sockaddr_storage addr;
+		socklen_t addrlen = sizeof addr;
+		int sock = accept(server_fd, (struct sockaddr*)&addr, &addrlen);
+		if (sock < 0) {
+			Log_PrintAndExit("accept(2) failed: %s", strerror(errno));
+		}
+		int pid = fork();
+		if (pid < 0) {
+			exit(3);
+		}
+		if (pid == 0) {
+			FILE* inf = fdopen(sock, "r");
+			FILE* outf = fdopen(sock, "w");
+			Service(inf, outf, docroot);
+			exit(0);
+		}
+		close(sock);
+	}
+}
+
+static void BecomeDaemon(void) {
+	if (chdir("/") < 0) {
+		Log_PrintAndExit("chdir(2) failed: %s", strerror(errno));
+	}
+	freopen("/dev/null", "r", stdin);
+	freopen("/dev/null", "w", stdout);
+	freopen("/dev/null", "w", stderr);
+
+	int n = fork();
+	if (n < 0) {
+		Log_PrintAndExit("fork(2) failed: %s", strerror(errno));
+	}
+	if (n != 0) {
+		_exit(0);
+	}
+	if (setsid() < 0) {
+		Log_PrintAndExit("setsid(2) failed: %s", strerror(errno));
+	}
+}
+
 static void* hmalloc(size_t sz) {
 	void* p = malloc(sz);
 	if (!p) {
@@ -392,12 +591,16 @@ static void Upcase(char* str) {
 	}
 }
 
-static void Log_PrintAndExit(char* fmt, ...) {
+static void Log_PrintAndExit(const char* fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
 
-	vfprintf(stderr, fmt, ap);
-	fputc('\n', stderr);
+	if (debug_mode) {
+		vfprintf(stderr, fmt, ap);
+		fputc('\n', stderr);
+	} else {
+		vsyslog(LOG_ERR, fmt, ap);
+	}
 
 	va_end(ap);
 	exit(1);
